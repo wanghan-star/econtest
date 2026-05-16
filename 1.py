@@ -1,3 +1,6 @@
+# 1280x960 camera input version
+# 注意：YOLO kmodel 仍然是 320x320 输入，AI2D 会把 1280x960 resize 到 320x320
+# LCD/UI 仍然是 640x480
 from libs.PipeLine import PipeLine, ScopedTiming
 from libs.AIBase import AIBase
 from libs.AI2D import Ai2d
@@ -10,8 +13,265 @@ import gc
 import time
 import utime
 import aidemo
+from machine import I2C, FPIOA
 
 from ybUtils.YbKey import YbKey
+
+
+# ==========================================================
+# INA226 电流 / 功率监测
+# ==========================================================
+INA226_ADDR = 0x40
+
+REG_CONFIG = 0x00
+REG_SHUNT_VOLTAGE = 0x01
+REG_BUS_VOLTAGE = 0x02
+REG_CURRENT = 0x04
+REG_CALIBRATION = 0x05
+
+RSHUNT = 0.0436
+SHUNT_LSB_V = 2.5e-6
+CURRENT_LSB = 0.0001
+CAL_VALUE = int(0.00512 / (CURRENT_LSB * RSHUNT))
+
+
+class INA226Monitor:
+    def __init__(self):
+        self.i2c = None
+        self.devices = []
+        self.ina_found = False
+        self.init_ok = False
+        self.ready = False
+        self.last_scan_ms = 0
+        self.error_text = ""
+
+        self.smooth_current_shunt = None
+        self.smooth_current_reg = None
+        self.alpha = 0.25
+
+        self.current_mA = 0.0
+        self.current_reg_mA = 0.0
+        self.power_W = 0.0
+        self.shunt_mV = 0.0
+        self.raw_shunt = 0
+        self.bus_V = 0.0
+        self.raw_bus = 0
+
+        self.setup()
+
+    def setup(self):
+        try:
+            fpioa = FPIOA()
+
+            fpioa.set_function(
+                34,
+                FPIOA.IIC1_SCL,
+                oe=1,
+                ie=1,
+                pu=1,
+                st=1,
+                ds=15,
+            )
+
+            fpioa.set_function(
+                35,
+                FPIOA.IIC1_SDA,
+                oe=1,
+                ie=1,
+                pu=1,
+                st=1,
+                ds=15,
+            )
+
+            self.i2c = I2C(1, scl=34, sda=35, freq=40000)
+            self.ready = True
+            print("INA226 IIC1 init ok")
+
+        except Exception as e:
+            self.ready = False
+            self.error_text = "IIC init error"
+            print("INA226 IIC1 init failed:", e)
+
+    def write_reg16(self, reg, value):
+        value = int(value) & 0xFFFF
+        data = bytes([
+            (value >> 8) & 0xFF,
+            value & 0xFF,
+        ])
+        self.i2c.writeto_mem(INA226_ADDR, reg, data)
+
+    def read_reg16_u(self, reg):
+        data = self.i2c.readfrom_mem(INA226_ADDR, reg, 2)
+        return (int(data[0]) << 8) | int(data[1])
+
+    def read_reg16_s(self, reg):
+        value = self.read_reg16_u(reg)
+        if value & 0x8000:
+            value -= 65536
+        return value
+
+    def init_ina226(self):
+        self.write_reg16(REG_CONFIG, 0x4127)
+        self.write_reg16(REG_CALIBRATION, CAL_VALUE)
+
+    def read_current_by_shunt(self):
+        raw_shunt = self.read_reg16_s(REG_SHUNT_VOLTAGE)
+        shunt_v = raw_shunt * SHUNT_LSB_V
+        shunt_mv = shunt_v * 1000.0
+        current_a = shunt_v / RSHUNT
+
+        if current_a < 0:
+            current_a = -current_a
+
+        return current_a * 1000.0, shunt_mv, raw_shunt
+
+    def read_current_by_current_reg(self):
+        self.write_reg16(REG_CALIBRATION, CAL_VALUE)
+        raw_current = self.read_reg16_s(REG_CURRENT)
+        current_a = raw_current * CURRENT_LSB
+
+        if current_a < 0:
+            current_a = -current_a
+
+        return current_a * 1000.0, raw_current
+
+    def read_bus_voltage(self):
+        raw_bus = self.read_reg16_u(REG_BUS_VOLTAGE)
+        bus_v = raw_bus * 1.25 / 1000.0
+        return bus_v, raw_bus
+
+    def scan_devices(self):
+        try:
+            self.devices = self.i2c.scan()
+        except Exception:
+            self.devices = []
+
+        self.ina_found = INA226_ADDR in self.devices
+
+        if not self.ina_found:
+            self.init_ok = False
+            self.smooth_current_shunt = None
+            self.smooth_current_reg = None
+
+    def update(self):
+        if not self.ready:
+            return
+
+        now = time.ticks_ms()
+
+        if time.ticks_diff(now, self.last_scan_ms) > 1000:
+            self.last_scan_ms = now
+            self.scan_devices()
+
+        if not self.ina_found:
+            return
+
+        try:
+            if not self.init_ok:
+                self.init_ina226()
+                self.init_ok = True
+
+            current_shunt_mA, shunt_mV, raw_shunt = self.read_current_by_shunt()
+            current_reg_mA, raw_current = self.read_current_by_current_reg()
+
+            if self.smooth_current_shunt is None:
+                self.smooth_current_shunt = current_shunt_mA
+            else:
+                self.smooth_current_shunt = (
+                    self.smooth_current_shunt * (1.0 - self.alpha)
+                    + current_shunt_mA * self.alpha
+                )
+
+            if self.smooth_current_reg is None:
+                self.smooth_current_reg = current_reg_mA
+            else:
+                self.smooth_current_reg = (
+                    self.smooth_current_reg * (1.0 - self.alpha)
+                    + current_reg_mA * self.alpha
+                )
+
+            self.current_mA = self.smooth_current_shunt
+            self.current_reg_mA = self.smooth_current_reg
+            self.power_W = (self.current_mA / 1000.0) * 5.0
+            self.shunt_mV = shunt_mV
+            self.raw_shunt = raw_shunt
+
+            try:
+                self.bus_V, self.raw_bus = self.read_bus_voltage()
+            except Exception:
+                self.bus_V = 0.0
+                self.raw_bus = 0
+
+            self.error_text = ""
+
+        except Exception as e:
+            self.init_ok = False
+            self.error_text = str(e)
+
+    def draw_overlay(self, pl):
+        x = 405
+        y = 10
+
+        if not self.ready:
+            pl.osd_img.draw_string_advanced(
+                x,
+                y,
+                18,
+                "INA226 IIC ERR",
+                color=(255, 255, 0, 0),
+            )
+            return
+
+        if not self.ina_found:
+            pl.osd_img.draw_string_advanced(
+                x,
+                y,
+                18,
+                "INA226 NOT FOUND",
+                color=(255, 255, 0, 0),
+            )
+            return
+
+        if self.error_text:
+            pl.osd_img.draw_string_advanced(
+                x,
+                y,
+                18,
+                "INA226 READ ERR",
+                color=(255, 255, 0, 0),
+            )
+            return
+
+        pl.osd_img.draw_string_advanced(
+            x,
+            y,
+            18,
+            "I: %.1f mA" % self.current_mA,
+            color=(255, 255, 255, 255),
+        )
+
+        pl.osd_img.draw_string_advanced(
+            x,
+            y + 24,
+            18,
+            "P: %.3f W" % self.power_W,
+            color=(255, 255, 255, 0),
+        )
+
+        pl.osd_img.draw_string_advanced(
+            x,
+            y + 48,
+            18,
+            "Bus: %.3f V" % self.bus_V,
+            color=(255, 180, 220, 255),
+        )
+
+    def deinit(self):
+        try:
+            if self.i2c:
+                self.i2c.deinit()
+        except Exception:
+            pass
 
 
 # ==========================================================
@@ -219,7 +479,7 @@ class SegmentationApp(AIBase):
         confidence_threshold=0.10,
         nms_threshold=0.45,
         mask_threshold=0.45,
-        rgb888p_size=[320, 320],
+        rgb888p_size=[1280, 960],
         display_size=[640, 480],
         debug_mode=0,
     ):
@@ -247,15 +507,72 @@ class SegmentationApp(AIBase):
         )
 
         # ======================================================
-        # D-bottom_y 标定参数
-        # 当前是占位公式，后面替换成你的插值公式或插值表
+        # D-bottom_y 标定表
+        # 单位：D 为 cm，bottom_y 为 640x480 显示坐标下的目标底部像素 y
+        # 标定数据来自已测量的 D-像素位置对应关系。
         # ======================================================
-        self.D_a = 0.0
-        self.D_b = -0.20
-        self.D_c = 120.0
+        self.distance_calib = [
+            (477, 50.0),
+            (474, 51.0),
+            (469, 52.0),
+            (466, 53.0),
+            (459, 54.0),
+            (457, 55.0),
+            (452, 56.0),
+            (449, 57.0),
+            (447, 58.0),
+            (443, 59.0),
+            (441, 60.0),
+            (438, 61.0),
+            (435, 62.0),
+            (433, 63.0),
+            (428, 64.0),
+            (426, 65.0),
+            (425.5, 66.0),
+            (425, 67.0),
+            (421, 68.0),
+            (420, 69.0),
+            (418, 70.0),
+            (417, 71.0),
+            (413, 72.0),
+            (412, 73.0),
+            (411, 74.0),
+            (408, 75.0),
+            (405, 76.0),
+            (404, 77.0),
+            (403, 78.0),
+            (402, 79.0),
+            (400, 80.0),
+            (399, 81.0),
+            (397, 82.0),
+            (396, 83.0),
+            (394, 84.0),
+            (393, 85.0),
+            (388, 86.0),
+            (387, 87.0),
+            (386, 88.0),
+            (385, 89.0),
+            (384.5, 90.0),
+            (384, 91.0),
+            (383, 92.0),
+            (381, 93.0),
+            (380.5, 94.0),
+            (380, 95.0),
+            (379, 96.0),
+            (378, 97.0),
+            (377.5, 98.0),
+            (373, 99.0),
+            (372.5, 100.0),
+        ]
 
         # H = D * hpix / fy_pixel
-        self.fy_pixel = 420.0
+        # 用户提供的 GC2093 内参对应 1280x960：fy = 1200.6879329729338
+        # 当前结果绘制在 640x480 坐标系下，因此 fy 乘以 0.5。
+        self.fy_pixel = 600.3439664864669
+
+        #hansome校准
+        self.HEIGHT_SCALE = 1.129
+        #hhh
 
         # 液面滤波
         self.level_history = []
@@ -406,18 +723,46 @@ class SegmentationApp(AIBase):
     # D / H / L
     # ======================================================
     def estimate_distance(self, bottom_y):
-        D = self.D_a * bottom_y * bottom_y + self.D_b * bottom_y + self.D_c
+        # 使用 bottom_y-D 标定表做分段线性插值。
+        # D 的单位是 cm。
+        if self.distance_calib is None or len(self.distance_calib) == 0:
+            return 0
 
-        if D < 0:
-            D = 0
+        y = float(bottom_y)
 
-        return D
+        # 标定表按像素 y 从小到大排序：y 越小通常代表目标越远。
+        calib = []
+        for p in self.distance_calib:
+            calib.append((float(p[0]), float(p[1])))
+
+        calib.sort(key=lambda p: p[0])
+
+        # 超出标定范围时，使用边界值，避免输出离谱距离。
+        if y <= calib[0][0]:
+            return calib[0][1]
+
+        if y >= calib[len(calib) - 1][0]:
+            return calib[len(calib) - 1][1]
+
+        for i in range(len(calib) - 1):
+            y0, d0 = calib[i]
+            y1, d1 = calib[i + 1]
+
+            if y >= y0 and y <= y1:
+                if y1 == y0:
+                    return (d0 + d1) / 2.0
+
+                t = (y - y0) / (y1 - y0)
+                return d0 + t * (d1 - d0)
+
+        return calib[len(calib) - 1][1]
 
     def estimate_height(self, D, hpix):
         if self.fy_pixel <= 0:
             return 0
 
         H = D * hpix / self.fy_pixel
+        H = H * self.HEIGHT_SCALE  # hansome校准
         return H
 
     def estimate_liquid_height(self, H, bottom_y, level_y, hpix):
@@ -434,6 +779,7 @@ class SegmentationApp(AIBase):
             lpix = hpix
 
         L = H * lpix / hpix
+        L = L * self.HEIGHT_SCALE  # hansome校准
         return L
 
     # ======================================================
@@ -1377,7 +1723,7 @@ class MeasureUI:
             120,
             55,
             34,
-            "K230 Measuring System",
+            "K230 Measure 1280",
             color=(255, 255, 255, 255),
         )
 
@@ -1491,15 +1837,21 @@ if __name__ == "__main__":
     confidence_threshold = 0.10
     nms_threshold = 0.45
     mask_threshold = 0.45
-    rgb888p_size = [320, 320]
+
+    # 关键修改：采集/AI输入源尺寸改为 1280x960
+    # 注意：kmodel 仍是 320x320，config_preprocess() 会自动 resize 到 model_input_size=[320, 320]
+    rgb888p_size = [1280, 960]
 
     pl = None
     seg = None
+    touch = None
+    power_monitor = None
 
     try:
         key = YbKey()
         touch = TouchReader(display_size)
         ui = MeasureUI(display_size)
+        power_monitor = INA226Monitor()
 
         pl = PipeLine(
             rgb888p_size=rgb888p_size,
@@ -1523,6 +1875,10 @@ if __name__ == "__main__":
 
         seg.config_preprocess()
 
+        print("Camera/RGB input size:", rgb888p_size)
+        print("Model input size: [320, 320]")
+        print("Display/UI size:", display_size)
+
         while True:
             with ScopedTiming("total", 1):
                 clicked, tx, ty = touch.get_click()
@@ -1541,11 +1897,13 @@ if __name__ == "__main__":
                         seg.start_fixed_measurement()
                     time.sleep_ms(300)
 
+                power_monitor.update()
                 img = pl.get_frame()
 
                 # 主页不跑 AI，节省算力
                 if ui.mode == ui.MODE_HOME:
                     ui.draw_home(pl)
+                    power_monitor.draw_overlay(pl)
                     pl.show_image()
                     gc.collect()
                     continue
@@ -1620,6 +1978,7 @@ if __name__ == "__main__":
 
                     ui.draw_fixed_ui(pl, seg)
 
+                power_monitor.draw_overlay(pl)
                 pl.show_image()
                 gc.collect()
 
@@ -1645,6 +2004,12 @@ if __name__ == "__main__":
         try:
             if touch and touch.tp:
                 touch.tp.deinit()
+        except Exception:
+            pass
+
+        try:
+            if power_monitor:
+                power_monitor.deinit()
         except Exception:
             pass
 
